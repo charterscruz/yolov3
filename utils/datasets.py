@@ -439,7 +439,7 @@ class LoadImagesAndLabels(Dataset):
         self.img_files = list(cache.keys())  # update
         self.label_files = img2label_paths(cache.keys())  # update
         n = len(shapes)  # number of images
-        bi = np.floor(np.arange(n) / batch_size).astype(np.int)  # batch index
+        bi = np.floor(np.arange(n) / batch_size).astype(np.int64)  # batch index
         nb = bi[-1] + 1  # number of batches
         self.batch = bi  # batch index of image
         self.n = n
@@ -481,7 +481,7 @@ class LoadImagesAndLabels(Dataset):
                 elif mini > 1:
                     shapes[i] = [1, 1 / mini]
 
-            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+            self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int64) * stride
 
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs, self.img_npy = [None] * n, [None] * n
@@ -511,13 +511,14 @@ class LoadImagesAndLabels(Dataset):
         nm, nf, ne, nc, msgs = 0, 0, 0, 0, []  # number missing, found, empty, corrupt, messages
         desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels..."
         with Pool(NUM_THREADS) as pool:
-            pbar = tqdm(pool.imap(verify_image_label, zip(self.img_files, self.label_files, repeat(prefix))),
+            pbar = tqdm(pool.imap(verify_image_label_fod, zip(self.img_files, self.label_files, repeat(prefix))),
                         desc=desc, total=len(self.img_files))
             for im_file, l, shape, segments, nm_f, nf_f, ne_f, nc_f, msg in pbar:
                 nm += nm_f
                 nf += nf_f
                 ne += ne_f
                 nc += nc_f
+                print('nc_f: ', nc_f)
                 if im_file:
                     x[im_file] = [l, shape, segments]
                 if msg:
@@ -904,7 +905,7 @@ def verify_image_label(args):
         if os.path.isfile(lb_file):
             nf = 1  # label found
             with open(lb_file) as f:
-                l = [x.split() for x in f.read().strip().splitlines() if len(x)]
+                l = [x.split() for x[0] in f.read().strip().splitlines() if len(x)] # TODO problem unpacking values from txt
                 if any([len(x) > 8 for x in l]):  # is segment
                     classes = np.array([x[0] for x in l], dtype=np.float32)
                     segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
@@ -929,6 +930,71 @@ def verify_image_label(args):
             l = np.zeros((0, 5), dtype=np.float32)
         return im_file, l, shape, segments, nm, nf, ne, nc, msg
     except Exception as e:
+        nc = 1
+        msg = f'{prefix}WARNING: {im_file}: ignoring corrupt image/label: {e}'
+        return [None, None, None, None, nm, nf, ne, nc, msg]
+
+
+def verify_image_label_fod(args):
+    # Verify one image-label pair
+    im_file, lb_file, prefix = args
+    nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, '', []  # number (missing, found, empty, corrupt), message, segments
+    try:
+        # verify images
+        im = Image.open(im_file)
+        im.verify()  # PIL verify
+        shape = exif_size(im)  # image size
+        assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+        assert im.format.lower() in IMG_FORMATS, f'invalid image format {im.format}'
+        if im.format.lower() in ('jpg', 'jpeg'):
+            with open(im_file, 'rb') as f:
+                f.seek(-2, 2)
+                if f.read() != b'\xff\xd9':  # corrupt JPEG
+                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, 'JPEG', subsampling=0, quality=100)
+                    msg = f'{prefix}WARNING: {im_file}: corrupt JPEG restored and saved'
+
+        # verify labels
+        if os.path.isfile(lb_file):
+            nf = 1  # label found
+            l = np.loadtxt(lb_file)
+            l = l.reshape((-1, 5))
+            nl = l.shape[0]
+            if nl:
+                assert l.shape[1] == 5, f'labels require 5 columns, {l.shape[1]} columns detected'
+                assert (l >= 0).all(), f'negative label values {l[l < 0]}'
+                assert (l[:, 1:] <= 1).all(), f'non-normalized or out of bounds coordinates {l[:, 1:][l[:, 1:] > 1]}'
+
+            
+            ne = 0
+
+            # with open(lb_file) as f:
+            #     l = [x.split() for x[0] in f.read().strip().splitlines() if len(x)] # TODO problem unpacking values from txt
+            #     if any([len(x) > 8 for x in l]):  # is segment
+            #         classes = np.array([x[0] for x in l], dtype=np.float32)
+            #         segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
+            #         l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+            #     l = np.array(l, dtype=np.float32)
+            # nl = len(l)
+            # if nl:
+            #     assert l.shape[1] == 5, f'labels require 5 columns, {l.shape[1]} columns detected'
+            #     assert (l >= 0).all(), f'negative label values {l[l < 0]}'
+            #     assert (l[:, 1:] <= 1).all(), f'non-normalized or out of bounds coordinates {l[:, 1:][l[:, 1:] > 1]}'
+            #     _, i = np.unique(l, axis=0, return_index=True)
+            #     if len(i) < nl:  # duplicate row check
+            #         l = l[i]  # remove duplicates
+            #         if segments:
+            #             segments = segments[i]
+            #         msg = f'{prefix}WARNING: {im_file}: {nl - len(i)} duplicate labels removed'
+            # else:
+            #     ne = 1  # label empty
+            #     l = np.zeros((0, 5), dtype=np.float32)
+        else:
+            nm = 1  # label missing
+            l = np.zeros((0, 5), dtype=np.float32)
+            msg = f'{prefix}WARNING: {im_file}: label missing'
+        return im_file, l, shape, segments, nm, nf, ne, nc, msg
+    except Exception as e:
+        
         nc = 1
         msg = f'{prefix}WARNING: {im_file}: ignoring corrupt image/label: {e}'
         return [None, None, None, None, nm, nf, ne, nc, msg]
